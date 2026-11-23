@@ -1,0 +1,78 @@
+# Render Blueprint for MediSync.
+#
+# One Node web service serves the API and the built React app (SERVE_CLIENT=true),
+# a managed Postgres database stores all records, and a mounted disk keeps the
+# uploaded prescription files across deploys.
+#
+# Create it with: Render Dashboard → New → Blueprint → pick this repository and set
+# the Blueprint Path to `medisync/render.yaml`. Render then asks for the `sync: false`
+# values below (Google Maps keys, mail/SMS credentials) before the first deploy.
+#
+# Both resources use paid plans on purpose: free Render Postgres databases expire
+# after 30 days and free web services cannot attach a disk, so neither gives a
+# permanent site.
+
+services:
+  - type: web
+    name: medisync
+    runtime: node
+    plan: 0.5c-512mb
+    region: singapore
+    rootDir: medisync
+    buildCommand: npm run build
+    # Runs on every deploy, after the build and before the new version starts.
+    preDeployCommand: npm run db:migrate
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    disk:
+      name: medisync-uploads
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Serve client/dist from the same origin as /api.
+      - key: SERVE_CLIENT
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: medisync-db
+          property: connectionString
+      # Render's internal connection string does not need TLS.
+      - key: DATABASE_SSL
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      # Prescription files live on the mounted disk, not the ephemeral filesystem.
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      # Licences must be checked by an admin in production.
+      - key: AUTO_VERIFY_PHARMACIES
+        value: "false"
+      # Never return OTPs in API responses in production.
+      - key: DEV_LOG_OTP
+        value: "false"
+      # httpOnly session cookie lifetime, and the daily health-data retention sweep
+      # (prescription files of finished orders, old notifications, expired geo cache).
+      - key: SESSION_COOKIE_DAYS
+        value: "7"
+      - key: RETENTION_CRON
+        value: "0 3 * * *"
+      - key: PRESCRIPTION_RETENTION_DAYS
+        value: "180"
+      # Optional: a dedicated 64-hex-character AES-256 key for prescription files.
+      # When unset, the key is derived from JWT_SECRET (files are still encrypted).
+      # - key: FILE_ENCRYPTION_KEY
+      #   sync: false
+      # Optional: add real values in the dashboard after the first deploy.
+      - key: GOOGLE_MAPS_SERVER_KEY
+        sync: false
+      - key: GOOGLE_MAPS_BROWSER_KEY
+        sync: false
+
+databases:
+  - name: medisync-db
+    databaseName: medisync
+    user: medisync
+    plan: 0.1c-256mb
+    region: singapore

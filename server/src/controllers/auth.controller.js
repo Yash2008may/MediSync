@@ -4,6 +4,7 @@ import { env } from '../config/env.js';
 import { query, withTransaction } from '../config/db.js';
 import { AppError, asyncHandler } from '../utils/AppError.js';
 import { findUserByIdentifier, toPublicUser } from '../services/userService.js';
+import { normalizePhone } from '../utils/phone.js';
 import { generateOtp, hashOtp, safeEqual, sendOtpNotifications } from '../services/otpService.js';
 import { recordConsent } from '../services/consentService.js';
 import { clearSessionCookie, setSessionCookie } from '../utils/session.js';
@@ -28,57 +29,240 @@ async function sendSession(res, user, status = 200) {
 
 // ---------------------------------------------------------------- REGISTER
 export const registerPatient = asyncHandler(async (req, res) => {
-  const d = req.body;
-  const passwordHash = await bcrypt.hash(d.password, env.bcryptRounds);
+const d = req.body;
+const phone = normalizePhone(d.phone);
+const passwordHash = await bcrypt.hash(d.password, env.bcryptRounds);
 
-  const user = await withTransaction(async (c) => {
+let user;
+try {
+user = await withTransaction(async (c) => {
+  const { rows: existing } = await c.query(
+    `SELECT * FROM users WHERE lower(email) = lower($1) OR phone = $2 LIMIT 1`,
+    [d.email, phone]
+  );
+
+  let targetUser;
+  if (existing[0]) {
+    if (existing[0].is_active) {
+      throw new AppError(409, 'An account with this email or mobile number already exists.');
+    }
+    if (existing[0].role !== 'patient') {
+      throw new AppError(409, 'This email or mobile number is associated with another role.');
+    }
+
+    const { rows } = await c.query(
+      `UPDATE users
+          SET email = $1, phone = $2, password_hash = $3, is_active = TRUE, updated_at = now()
+        WHERE id = $4
+        RETURNING *`,
+      [d.email, phone, passwordHash, existing[0].id]
+    );
+    targetUser = rows[0];
+
+    const { rowCount } = await c.query(
+      `UPDATE patients
+          SET name = $2,
+              address = $3,
+              home_lat = $4,
+              home_lng = $5,
+              timezone = COALESCE($6, 'Asia/Kolkata'),
+              notify_sms = $7,
+              notify_email = $7
+        WHERE user_id = $1`,
+      [
+        targetUser.id,
+        d.name,
+        d.address,
+        d.homeLat ?? null,
+        d.homeLng ?? null,
+        d.timezone ?? null,
+        d.consents.notifications,
+      ]
+    );
+
+    if (!rowCount) {
+      await c.query(
+        `INSERT INTO patients (user_id, name, address, home_lat, home_lng, timezone, notify_sms, notify_email)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Asia/Kolkata'), $7, $7)`,
+        [
+          targetUser.id,
+          d.name,
+          d.address,
+          d.homeLat ?? null,
+          d.homeLng ?? null,
+          d.timezone ?? null,
+          d.consents.notifications,
+        ]
+      );
+    }
+  } else {
     const { rows } = await c.query(
       `INSERT INTO users (role, email, phone, password_hash)
        VALUES ('patient', $1, $2, $3) RETURNING *`,
-      [d.email, d.phone, passwordHash]
+      [d.email, phone, passwordHash]
     );
+    targetUser = rows[0];
     await c.query(
       `INSERT INTO patients (user_id, name, address, home_lat, home_lng, timezone, notify_sms, notify_email)
        VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Asia/Kolkata'), $7, $7)`,
-      [rows[0].id, d.name, d.address, d.homeLat ?? null, d.homeLng ?? null, d.timezone ?? null, d.consents.notifications]
+      [
+        targetUser.id,
+        d.name,
+        d.address,
+        d.homeLat ?? null,
+        d.homeLng ?? null,
+        d.timezone ?? null,
+        d.consents.notifications,
+      ]
     );
-    await recordConsent(c, rows[0].id, 'privacy_policy', true);
-    await recordConsent(c, rows[0].id, 'health_data_processing', true);
-    await recordConsent(c, rows[0].id, 'notifications', d.consents.notifications);
-    return rows[0];
-  });
+  }
 
-  await sendSession(res, user, 201);
+  await recordConsent(c, targetUser.id, 'privacy_policy', true);
+  await recordConsent(c, targetUser.id, 'health_data_processing', true);
+  await recordConsent(c, targetUser.id, 'notifications', d.consents.notifications);
+  return targetUser;
+});
+} catch (error) {
+if (error?.code === '23505') {
+  throw new AppError(409, 'An account with this email or mobile number already exists.');
+}
+throw error;
+}
+
+await sendSession(res, user, 201);
 });
 
 export const registerPharmacy = asyncHandler(async (req, res) => {
-  const d = req.body;
-  const passwordHash = await bcrypt.hash(d.password, env.bcryptRounds);
+const d = req.body;
+const phone = normalizePhone(d.phone);
+const passwordHash = await bcrypt.hash(d.password, env.bcryptRounds);
+const auto = env.autoVerifyPharmacies;
+const nextStatus = auto ? 'approved' : 'pending';
+const nextNote = auto ? 'Auto-verified (AUTO_VERIFY_PHARMACIES, testing only)' : null;
 
-  const user = await withTransaction(async (c) => {
+let user;
+try {
+user = await withTransaction(async (c) => {
+  const { rows: existing } = await c.query(
+    `SELECT * FROM users WHERE lower(email) = lower($1) OR phone = $2 LIMIT 1`,
+    [d.email, phone]
+  );
+
+  let targetUser;
+  if (existing[0]) {
+    if (existing[0].is_active) {
+      throw new AppError(409, 'An account with this email or mobile number already exists.');
+    }
+    if (existing[0].role !== 'pharmacy') {
+      throw new AppError(409, 'This email or mobile number is associated with another role.');
+    }
+
+    const { rows } = await c.query(
+      `UPDATE users
+          SET email = $1, phone = $2, password_hash = $3, is_active = TRUE, updated_at = now()
+        WHERE id = $4
+        RETURNING *`,
+      [d.email, phone, passwordHash, existing[0].id]
+    );
+    targetUser = rows[0];
+
+    const { rowCount } = await c.query(
+      `UPDATE pharmacies
+          SET store_name = $2,
+              license_number = $3,
+              address = $4,
+              latitude = $5,
+              longitude = $6,
+              place_id = $7,
+              maps_verified = $8,
+              verification_status = $9::text,
+              verified_at = CASE WHEN $9::text = 'approved' THEN now() ELSE NULL END,
+              verification_note = $10,
+              needs_review = FALSE,
+              review_reason = NULL,
+              pharmacist_name = $11,
+              pharmacist_reg_no = $12
+        WHERE user_id = $1`,
+      [
+        targetUser.id,
+        d.storeName,
+        d.licenseNumber,
+        d.address,
+        d.latitude,
+        d.longitude,
+        d.placeId ?? null,
+        Boolean(d.placeId),
+        nextStatus,
+        nextNote,
+        d.pharmacistName ?? null,
+        d.pharmacistRegNo ?? null,
+      ]
+    );
+
+    if (!rowCount) {
+      await c.query(
+        `INSERT INTO pharmacies
+           (user_id, store_name, license_number, address, latitude, longitude, place_id, maps_verified,
+            verification_status, verified_at, verification_note, pharmacist_name, pharmacist_reg_no)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text,
+                 CASE WHEN $9::text = 'approved' THEN now() END, $10, $11, $12)`,
+        [
+          targetUser.id,
+          d.storeName,
+          d.licenseNumber,
+          d.address,
+          d.latitude,
+          d.longitude,
+          d.placeId ?? null,
+          Boolean(d.placeId),
+          nextStatus,
+          nextNote,
+          d.pharmacistName ?? null,
+          d.pharmacistRegNo ?? null,
+        ]
+      );
+    }
+  } else {
     const { rows } = await c.query(
       `INSERT INTO users (role, email, phone, password_hash)
        VALUES ('pharmacy', $1, $2, $3) RETURNING *`,
-      [d.email, d.phone, passwordHash]
+      [d.email, phone, passwordHash]
     );
-    // Dev shortcut only (AUTO_VERIFY_PHARMACIES). Otherwise an admin must approve the licence.
-    const auto = env.autoVerifyPharmacies;
+    targetUser = rows[0];
     await c.query(
       `INSERT INTO pharmacies
          (user_id, store_name, license_number, address, latitude, longitude, place_id, maps_verified,
           verification_status, verified_at, verification_note, pharmacist_name, pharmacist_reg_no)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text,
                CASE WHEN $9::text = 'approved' THEN now() END, $10, $11, $12)`,
-      [rows[0].id, d.storeName, d.licenseNumber, d.address, d.latitude, d.longitude, d.placeId ?? null,
-       Boolean(d.placeId), auto ? 'approved' : 'pending',
-       auto ? 'Auto-verified (AUTO_VERIFY_PHARMACIES, testing only)' : null,
-       d.pharmacistName ?? null, d.pharmacistRegNo ?? null]
+      [
+        targetUser.id,
+        d.storeName,
+        d.licenseNumber,
+        d.address,
+        d.latitude,
+        d.longitude,
+        d.placeId ?? null,
+        Boolean(d.placeId),
+        nextStatus,
+        nextNote,
+        d.pharmacistName ?? null,
+        d.pharmacistRegNo ?? null,
+      ]
     );
-    await recordConsent(c, rows[0].id, 'privacy_policy', true);
-    return rows[0];
-  });
+  }
 
-  await sendSession(res, user, 201);
+  await recordConsent(c, targetUser.id, 'privacy_policy', true);
+  return targetUser;
+});
+} catch (error) {
+if (error?.code === '23505') {
+  throw new AppError(409, 'An account with this email or mobile number already exists.');
+}
+throw error;
+}
+
+await sendSession(res, user, 201);
 });
 
 // ---------------------------------------------------- ADMIN ONE-TIME SIGN-UP
